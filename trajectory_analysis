@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""
+分子动力学分析脚本，用于对比两个小分子（MOL）介导的蛋白质-蛋白质相互作用的两次模拟以及apo组。
+分析包括 RMSD、RMSF、氢键、接触、PCA、FEL、关键帧提取和 gmx_MMPBSA 结合能关联。
+适配文件：
+  - 模拟1：拓扑 ./h1v/md.tpr， 轨迹 ./h1v/md_pbc.xtc
+  - 模拟2：拓扑 ./h3v/md.tpr， 轨迹 ./h3v/md_pbc.xtc
+  - apo组：拓扑 ./apo/md.tpr， 轨迹 ./apo/md_pbc.xtc
+  - MMPBSA 输出：h1v_mmpbsa_delta.csv, h3v_mmpbsa_delta.csv（需含 Frame 和 TOTAL 列）
+输出：
+  - 数据文件：RMSD、RMSF、氢键、接触、PCA、FEL 数据 (.dat)
+  - 图片：分析结果可视化 (.png, 300 DPI)
+  - 关键帧：低能量构象 PDB 文件
+依赖库：MDAnalysis, numpy, matplotlib, pandas, pickle
+运行：python molecular_dynamics_analysis.py
+"""
+
+import MDAnalysis as mda
+from MDAnalysis.analysis import rms, align
+from MDAnalysis.analysis.hydrogenbonds import HydrogenBondAnalysis
+from MDAnalysis.analysis import contacts
+from MDAnalysis.analysis import pca
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import pickle
+import os
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+
+# 定义颜色映射，确保一致性
+colors = {
+    'H-1-V': 'blue',
+    'H-3-V': 'red',
+    'apo': 'green',
+    'H-1-V_dark': 'darkblue',
+    'H-1-V_light': 'lightblue',
+    'H-3-V_dark': 'darkred',
+    'H-3-V_light': 'lightcoral'
+}
+
+def calculate_rmsd(sim1_top="./h1v/md.tpr", sim1_traj="./h1v/md_pbc.xtc",
+                   sim2_top="./h3v/md.tpr", sim2_traj="./h3v/md_pbc.xtc",
+                   apo_top="./apo/md.tpr", apo_traj="./apo/md_pbc.xtc",
+                   output_prefix="rmsd"):
+    """
+    计算三次模拟的蛋白质骨架RMSD（sim1和sim2包括小分子MOL的RMSD），生成曲线图。
+    """
+    try:
+        # 模拟1
+        u1 = mda.Universe(sim1_top, sim1_traj)
+        protein1 = u1.select_atoms("protein and backbone")
+        ligand1 = u1.select_atoms("resname MOL")
+        ref1 = mda.Universe(sim1_top, sim1_traj)
+        rmsd_protein1 = rms.RMSD(protein1, ref1.select_atoms("protein and backbone"), select="backbone").run()
+        rmsd_ligand1 = rms.RMSD(ligand1, ref1.select_atoms("resname MOL")).run()
+        np.savetxt(f"{output_prefix}_sim1.dat", np.column_stack((rmsd_protein1.rmsd[:, 1], rmsd_protein1.rmsd[:, 2], rmsd_ligand1.rmsd[:, 2])),
+                   header="Time(ps) Protein_RMSD(A) Ligand_RMSD(A)", fmt="%.3f")
+        print(f"RMSD sim1 data saved to {output_prefix}_sim1.dat")
+
+        # 模拟2
+        u2 = mda.Universe(sim2_top, sim2_traj)
+        protein2 = u2.select_atoms("protein and backbone")
+        ligand2 = u2.select_atoms("resname MOL")
+        ref2 = mda.Universe(sim2_top, sim2_traj)
+        rmsd_protein2 = rms.RMSD(protein2, ref2.select_atoms("protein and backbone"), select="backbone").run()
+        rmsd_ligand2 = rms.RMSD(ligand2, ref2.select_atoms("resname MOL")).run()
+        np.savetxt(f"{output_prefix}_sim2.dat", np.column_stack((rmsd_protein2.rmsd[:, 1], rmsd_protein2.rmsd[:, 2], rmsd_ligand2.rmsd[:, 2])),
+                   header="Time(ps) Protein_RMSD(A) Ligand_RMSD(A)", fmt="%.3f")
+        print(f"RMSD sim2 data saved to {output_prefix}_sim2.dat")
+
+        # apo组
+        u_apo = mda.Universe(apo_top, apo_traj)
+        protein_apo = u_apo.select_atoms("protein and backbone")
+        ref_apo = mda.Universe(apo_top, apo_traj)
+        rmsd_protein_apo = rms.RMSD(protein_apo, ref_apo.select_atoms("protein and backbone"), select="backbone").run()
+        np.savetxt(f"{output_prefix}_apo.dat", np.column_stack((rmsd_protein_apo.rmsd[:, 1], rmsd_protein_apo.rmsd[:, 2])),
+                   header="Time(ps) Protein_RMSD(A)", fmt="%.3f")
+        print(f"RMSD apo data saved to {output_prefix}_apo.dat")
+
+        # 绘制RMSD曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(rmsd_protein1.rmsd[:, 1], rmsd_protein1.rmsd[:, 2], label="Protein RMSD (H-1-V)", color=colors['H-1-V_dark'])
+        plt.plot(rmsd_ligand1.rmsd[:, 1], rmsd_ligand1.rmsd[:, 2], label="Ligand RMSD (H-1-V)", color=colors['H-1-V_light'])
+        plt.plot(rmsd_protein2.rmsd[:, 1], rmsd_protein2.rmsd[:, 2], label="Protein RMSD (H-3-V)", color=colors['H-3-V_dark'])
+        plt.plot(rmsd_ligand2.rmsd[:, 1], rmsd_ligand2.rmsd[:, 2], label="Ligand RMSD (H-3-V)", color=colors['H-3-V_light'])
+        plt.plot(rmsd_protein_apo.rmsd[:, 1], rmsd_protein_apo.rmsd[:, 2], label="Protein RMSD (apo)", color=colors['apo'])
+        plt.xlabel("Time (ps)", fontsize=12)
+        plt.ylabel("RMSD (Å)", fontsize=12)
+        plt.title("RMSD Analysis", fontsize=14)
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_plot.png", dpi=300)
+        plt.close()
+        print(f"RMSD plot saved to {output_prefix}_plot.png")
+    except Exception as e:
+        print(f"Error in RMSD calculation: {e}")
+
+def calculate_rmsf(sim1_top="./h1v/md.tpr", sim1_traj="./h1v/md_pbc.xtc",
+                   sim2_top="./h3v/md.tpr", sim2_traj="./h3v/md_pbc.xtc",
+                   apo_top="./apo/md.tpr", apo_traj="./apo/md_pbc.xtc",
+                   output_prefix="rmsf"):
+    """
+    计算三次模拟的蛋白质C-alpha原子的RMSF，生成曲线图。
+    """
+    try:
+        # 模拟1
+        u1 = mda.Universe(sim1_top, sim1_traj)
+        ca1 = u1.select_atoms("protein and name CA")
+        ref1 = mda.Universe(sim1_top, sim1_traj)
+        align.AlignTraj(u1, ref1, select="protein and backbone", in_memory=True).run()
+        rmsf1 = rms.RMSF(ca1).run()
+        residues1 = np.arange(len(rmsf1.rmsf)) + 1
+        np.savetxt(f"{output_prefix}_sim1.dat", np.column_stack((residues1, rmsf1.rmsf)),
+                   header="Residue RMSF(A)", fmt="%.3f")
+        print(f"RMSF sim1 data saved to {output_prefix}_sim1.dat")
+
+        # 模拟2
+        u2 = mda.Universe(sim2_top, sim2_traj)
+        ca2 = u2.select_atoms("protein and name CA")
+        ref2 = mda.Universe(sim2_top, sim2_traj)
+        align.AlignTraj(u2, ref2, select="protein and backbone", in_memory=True).run()
+        rmsf2 = rms.RMSF(ca2).run()
+        residues2 = np.arange(len(rmsf2.rmsf)) + 1
+        np.savetxt(f"{output_prefix}_sim2.dat", np.column_stack((residues2, rmsf2.rmsf)),
+                   header="Residue RMSF(A)", fmt="%.3f")
+        print(f"RMSF sim2 data saved to {output_prefix}_sim2.dat")
+
+        # apo组
+        u_apo = mda.Universe(apo_top, apo_traj)
+        ca_apo = u_apo.select_atoms("protein and name CA")
+        ref_apo = mda.Universe(apo_top, apo_traj)
+        align.AlignTraj(u_apo, ref_apo, select="protein and backbone", in_memory=True).run()
+        rmsf_apo = rms.RMSF(ca_apo).run()
+        residues_apo = np.arange(len(rmsf_apo.rmsf)) + 1
+        np.savetxt(f"{output_prefix}_apo.dat", np.column_stack((residues_apo, rmsf_apo.rmsf)),
+                   header="Residue RMSF(A)", fmt="%.3f")
+        print(f"RMSF apo data saved to {output_prefix}_apo.dat")
+
+        # 绘制RMSF曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(residues1, rmsf1.rmsf, label="RMSF (H-1-V)", color=colors['H-1-V'])
+        plt.plot(residues2, rmsf2.rmsf, label="RMSF (H-3-V)", color=colors['H-3-V'])
+        plt.plot(residues_apo, rmsf_apo.rmsf, label="RMSF (apo)", color=colors['apo'])
+        plt.xlabel("Residue Number", fontsize=12)
+        plt.ylabel("RMSF (Å)", fontsize=12)
+        plt.title("RMSF Analysis", fontsize=14)
+        plt.legend()
+        plt.grid(True, axis="y", linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_plot.png", dpi=300)
+        plt.close()
+        print(f"RMSF plot saved to {output_prefix}_plot.png")
+    except Exception as e:
+        print(f"Error in RMSF calculation: {e}")
+
+def analyze_bidirectional_hbonds(universe, output_prefix,
+                                protein_sel="protein",
+                                ligand_sel="resname MOL",
+                                d_a_cutoff=3.0,
+                                d_h_a_angle_cutoff=120.0):
+    """执行双向氢键分析并保存结果"""
+    donor_atoms = "name N or name O"
+    acceptor_atoms = "name O or name N"
+    hydrogen_atoms = "type H or name H*"
+
+    # 情况1: 蛋白质→配体 或 蛋白质→蛋白质 (apo组)
+    case1 = HydrogenBondAnalysis(
+        universe=universe,
+        donors_sel=f"{protein_sel} and ({donor_atoms})",
+        hydrogens_sel=f"{protein_sel} and ({hydrogen_atoms})",
+        acceptors_sel=f"{ligand_sel if ligand_sel else protein_sel} and ({acceptor_atoms})",
+        d_a_cutoff=d_a_cutoff,
+        d_h_a_angle_cutoff=d_h_a_angle_cutoff
+    )
+
+    # 情况2: 配体→蛋白质 (仅对sim1和sim2)
+    if ligand_sel:
+        case2 = HydrogenBondAnalysis(
+            universe=universe,
+            donors_sel=f"{ligand_sel} and ({donor_atoms})",
+            hydrogens_sel=f"{ligand_sel} and ({hydrogen_atoms})",
+            acceptors_sel=f"{protein_sel} and ({acceptor_atoms})",
+            d_a_cutoff=d_a_cutoff,
+            d_h_a_angle_cutoff=d_h_a_angle_cutoff
+        )
+    else:
+        case2 = None
+
+    # 运行分析
+    case1.run()
+    if case2:
+        case2.run()
+
+    # 保存详细结果
+    with open(f"{output_prefix}_detailed.csv", "w") as f:
+        f.write("Frame,Donor,Acceptor,Distance,Angle,Direction\n")
+        for bond in case1.results.hbonds:
+            direction = "Protein→Ligand" if ligand_sel else "Protein→Protein"
+            f.write(f"{int(bond[0])},{int(bond[1])},{int(bond[2])},{bond[4]:.3f},{bond[5]:.3f},{direction}\n")
+        if case2:
+            for bond in case2.results.hbonds:
+                f.write(f"{int(bond[0])},{int(bond[1])},{int(bond[2])},{bond[4]:.3f},{bond[5]:.3f},Ligand→Protein\n")
+
+    return case1, case2
+
+def calculate_hbonds(sim1_top="./h1v/md.tpr", sim1_traj="./h1v/md_pbc.xtc",
+                    sim2_top="./h3v/md.tpr", sim2_traj="./h3v/md_pbc.xtc",
+                    apo_top="./apo/md.tpr", apo_traj="./apo/md_pbc.xtc",
+                    output_prefix="hbonds"):
+    """
+    比较三次模拟的氢键形成情况（sim1和sim2为蛋白质-配体，apo为蛋白质内部）。
+    """
+    try:
+        # 模拟1分析
+        u1 = mda.Universe(sim1_top, sim1_traj)
+        hb1_p2l, hb1_l2p = analyze_bidirectional_hbonds(u1, f"{output_prefix}_sim1")
+        total1 = hb1_p2l.count_by_time() + hb1_l2p.count_by_time()
+
+        # 模拟2分析
+        u2 = mda.Universe(sim2_top, sim2_traj)
+        hb2_p2l, hb2_l2p = analyze_bidirectional_hbonds(u2, f"{output_prefix}_sim2")
+        total2 = hb2_p2l.count_by_time() + hb2_l2p.count_by_time()
+
+        # apo组分析
+        # u_apo = mda.Universe(apo_top, apo_traj)
+        # hb_apo_p2p, _ = analyze_bidirectional_hbonds(u_apo, f"{output_prefix}_apo", ligand_sel=None)
+        # total_apo = hb_apo_p2p.count_by_time()
+
+        # 绘制对比图
+        plt.figure(figsize=(10, 6))
+        plt.plot(hb1_p2l.times, total1, label="H-1-V", color=colors['H-1-V'])
+        plt.plot(hb2_p2l.times, total2, label="H-3-V", color=colors['H-3-V'])
+        # plt.plot(hb_apo_p2p.times, total_apo, label="apo", color=colors['apo'])
+        plt.xlabel("Time (ps)", fontsize=12)
+        plt.ylabel("Hydrogen Bond Count", fontsize=12)
+        plt.title("Bidirectional Hydrogen Bond Comparison", fontsize=14)
+        plt.legend()
+        plt.grid(linestyle="--", alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_comparison.png", dpi=300)
+        plt.close()
+
+        print(f"Results saved to {output_prefix}_sim1/2/apo_detailed.csv and {output_prefix}_comparison.png")
+    except Exception as e:
+        print(f"Analysis error: {str(e)}")
+
+def calculate_contacts(sim1_top="./h1v/md.tpr", sim1_traj="./h1v/md_pbc.xtc",
+                       sim2_top="./h3v/md.tpr", sim2_traj="./h3v/md_pbc.xtc",
+                       apo_top="./apo/md.tpr", apo_traj="./apo/md_pbc.xtc",
+                       output_prefix="contacts"):
+    """
+    计算三次模拟的接触（sim1和sim2包括蛋白质A-MOL，全部包括蛋白质A-蛋白质B），生成曲线图。
+    """
+    try:
+        # 模拟1
+        u1 = mda.Universe(sim1_top, sim1_traj)
+        protein_A1 = u1.select_atoms("protein and chainID A")
+        protein_B1 = u1.select_atoms("protein and chainID C")
+        ligand1 = u1.select_atoms("resname MOL")
+        # contact_A_ligand1 = contacts.Contacts(u1, select=(protein_A1, ligand1), refgroup=(protein_A1, ligand1), radius=4.0)
+        # contact_A_ligand1.run()
+        contact_A_B1 = contacts.Contacts(u1, select=(protein_A1, protein_B1), refgroup=(protein_A1, protein_B1), radius=4.0)
+        contact_A_B1.run()
+        np.savetxt(f"{output_prefix}_sim1.dat", np.column_stack((
+            # contact_A_ligand1.times, contact_A_ligand1.timeseries[:, 1], 
+                                                                contact_A_B1.timeseries[:, 1])),
+                   header="Time(ps) ProteinA_MOL_Contacts ProteinA_ProteinB_Contacts", fmt="%.3f")
+        print(f"Contacts sim1 data saved to {output_prefix}_sim1.dat")
+
+        # 模拟2
+        u2 = mda.Universe(sim2_top, sim2_traj)
+        protein_A2 = u2.select_atoms("protein and chainID A")
+        protein_B2 = u2.select_atoms("protein and chainID C")
+        ligand2 = u2.select_atoms("resname MOL")
+        # contact_A_ligand2 = contacts.Contacts(u2, select=(protein_A2, ligand2), refgroup=(protein_A2, ligand2), radius=4.0)
+        # contact_A_ligand2.run()
+        contact_A_B2 = contacts.Contacts(u2, select=(protein_A2, protein_B2), refgroup=(protein_A2, protein_B2), radius=4.0)
+        contact_A_B2.run()
+        np.savetxt(f"{output_prefix}_sim2.dat", np.column_stack((
+            # contact_A_ligand2.times, contact_A_ligand2.timeseries[:, 1], 
+                                                                 contact_A_B2.timeseries[:, 1])),
+                   header="Time(ps) ProteinA_MOL_Contacts ProteinA_ProteinB_Contacts", fmt="%.3f")
+        print(f"Contacts sim2 data saved to {output_prefix}_sim2.dat")
+
+        # apo组
+        u_apo = mda.Universe(apo_top, apo_traj)
+        protein_A_apo = u_apo.select_atoms("protein and chainID A")
+        protein_B_apo = u_apo.select_atoms("protein and chainID C")
+        contact_A_B_apo = contacts.Contacts(u_apo, select=(protein_A_apo, protein_B_apo), refgroup=(protein_A_apo, protein_B_apo), radius=4.0)
+        contact_A_B_apo.run()
+        np.savetxt(f"{output_prefix}_apo.dat", np.column_stack((contact_A_B_apo.times, contact_A_B_apo.timeseries[:, 1])),
+                   header="Time(ps) ProteinA_ProteinB_Contacts", fmt="%.3f")
+        print(f"Contacts apo data saved to {output_prefix}_apo.dat")
+
+        # 绘制接触数量曲线
+        plt.figure(figsize=(10, 6))
+        # plt.plot(contact_A_ligand1.times, contact_A_ligand1.timeseries[:, 1], label="11β-HSD1 - MOL (H-1-V)", color=colors['H-1-V_dark'])
+        plt.plot(contact_A_B1.times, contact_A_B1.timeseries[:, 1], label="11β-HSD1 - VHL (H-1-V)", color=colors['H-1-V_light'])
+        # plt.plot(contact_A_ligand2.times, contact_A_ligand2.timeseries[:, 1], label="11β-HSD1 - MOL (H-3-V)", color=colors['H-3-V_dark'])
+        plt.plot(contact_A_B2.times, contact_A_B2.timeseries[:, 1], label="11β-HSD1 - VHL (H-3-V)", color=colors['H-3-V_light'])
+        plt.plot(contact_A_B_apo.times, contact_A_B_apo.timeseries[:, 1], label="11β-HSD1 - VHL (apo)", color=colors['apo'])
+        plt.xlabel("Time (ps)", fontsize=12)
+        plt.ylabel("Number of Contacts", fontsize=12)
+        plt.title("Contact Analysis", fontsize=14)
+        plt.ylim(0, 0.3)
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_plot.png", dpi=300)
+        plt.close()
+        print(f"Contacts plot saved to {output_prefix}_plot.png")
+    except Exception as e:
+        print(f"Error in contact analysis: {e}")
+
+def calculate_pca_fel(sim1_top="./h1v/md.tpr", sim1_traj="./h1v/md_pbc.xtc",
+                      sim2_top="./h3v/md.tpr", sim2_traj="./h3v/md_pbc.xtc",
+                      apo_top="./apo/md.tpr", apo_traj="./apo/md_pbc.xtc",
+                      output_prefix="pca_fel"):
+    """
+    计算三次模拟的PCA和FEL，投影到共同参考空间，生成热图。
+    """
+    try:
+        # 加载和对齐轨迹
+        u1 = mda.Universe(sim1_top, sim1_traj)
+        u2 = mda.Universe(sim2_top, sim2_traj)
+        u_apo = mda.Universe(apo_top, apo_traj)
+        ref = mda.Universe(sim1_top, sim1_traj)
+        align.AlignTraj(u1, ref, select="protein and name CA", in_memory=True).run()
+        align.AlignTraj(u2, ref, select="protein and name CA", in_memory=True).run()
+        align.AlignTraj(u_apo, ref, select="protein and name CA", in_memory=True).run()
+
+       # 共同PCA，使用最后2000帧
+        pca_analysis = pca.PCA(u2, select="protein and name CA")
+        pca_analysis.run(start=-2000)
+        transformed1 = pca_analysis.transform(u1.select_atoms("protein and name CA"), start=-2000)
+        pc1_sim1 = transformed1[:, 0]
+        pc2_sim1 = transformed1[:, 1]
+
+        transformed2 = pca_analysis.transform(u2.select_atoms("protein and name CA"), start=-2000)
+        pc1_sim2 = transformed2[:, 0]
+        pc2_sim2 = transformed2[:, 1]
+
+        transformed_apo = pca_analysis.transform(u_apo.select_atoms("protein and name CA"), start=-2000)
+        pc1_apo = transformed_apo[:, 0]
+        pc2_apo = transformed_apo[:, 1]
+
+        # 保存PCA数据
+        np.savetxt(f"{output_prefix}_sim1.dat", np.column_stack((pc1_sim1, pc2_sim1)),
+                   header="PC1 PC2", fmt="%.3f")
+        np.savetxt(f"{output_prefix}_sim2.dat", np.column_stack((pc1_sim2, pc2_sim2)),
+                   header="PC1 PC2", fmt="%.3f")
+        np.savetxt(f"{output_prefix}_apo.dat", np.column_stack((pc1_apo, pc2_apo)),
+                   header="PC1 PC2", fmt="%.3f")
+        print(f"PCA data saved to {output_prefix}_sim1/2/apo.dat")
+
+        # 计算FEL
+        kT = 0.008314 * 300  # kT in kJ/mol at 300 K
+        hist1, xedges1, yedges1 = np.histogram2d(pc1_sim1, pc2_sim1, bins=50, density=True)
+        hist1 = np.clip(hist1, 1e-10, None)
+        fel1 = -kT * np.log(hist1 / np.max(hist1))
+        np.savetxt(f"{output_prefix}_fel_sim1.dat", fel1, header="Free Energy Landscape sim1 (kJ/mol)", fmt="%.3f")
+
+        hist2, xedges2, yedges2 = np.histogram2d(pc1_sim2, pc2_sim2, bins=50, density=True)
+        hist2 = np.clip(hist2, 1e-10, None)
+        fel2 = -kT * np.log(hist2 / np.max(hist2))
+        np.savetxt(f"{output_prefix}_fel_sim2.dat", fel2, header="Free Energy Landscape sim2 (kJ/mol)", fmt="%.3f")
+
+        hist_apo, xedges_apo, yedges_apo = np.histogram2d(pc1_apo, pc2_apo, bins=50, density=True)
+        hist_apo = np.clip(hist_apo, 1e-10, None)
+        fel_apo = -kT * np.log(hist_apo / np.max(hist_apo))
+        np.savetxt(f"{output_prefix}_fel_apo.dat", fel_apo, header="Free Energy Landscape apo (kJ/mol)", fmt="%.3f")
+        print(f"FEL data saved to {output_prefix}_fel_sim1/2/apo.dat")
+
+        # 绘制FEL热图
+        plt.figure(figsize=(18, 5))
+        plt.subplot(1, 3, 1)
+        plt.imshow(fel1.T, origin="lower", extent=[xedges1[0], xedges1[-1], yedges1[0], yedges1[-1]],
+                   cmap="viridis", interpolation="nearest")
+        plt.colorbar(label="Free Energy (kJ/mol)")
+        plt.xlabel("Principal Component 1", fontsize=12)
+        plt.ylabel("Principal Component 2", fontsize=12)
+        plt.title("FEL: H-1-V", fontsize=14)
+
+        plt.subplot(1, 3, 2)
+        plt.imshow(fel2.T, origin="lower", extent=[xedges2[0], xedges2[-1], yedges2[0], yedges2[-1]],
+                   cmap="viridis", interpolation="nearest")
+        plt.colorbar(label="Free Energy (kJ/mol)")
+        plt.xlabel("Principal Component 1", fontsize=12)
+        plt.ylabel("Principal Component 2", fontsize=12)
+        plt.title("FEL: H-3-V", fontsize=14)
+
+        plt.subplot(1, 3, 3)
+        plt.imshow(fel_apo.T, origin="lower", extent=[xedges_apo[0], xedges_apo[-1], yedges_apo[0], yedges_apo[-1]],
+                   cmap="viridis", interpolation="nearest")
+        plt.colorbar(label="Free Energy (kJ/mol)")
+        plt.xlabel("Principal Component 1", fontsize=12)
+        plt.ylabel("Principal Component 2", fontsize=12)
+        plt.title("FEL: apo", fontsize=14)
+
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_plot.png", dpi=300)
+        plt.close()
+        print(f"FEL plot saved to {output_prefix}_plot.png")
+
+        return pc1_sim1, pc2_sim1, fel1, xedges1, yedges1, pc1_sim2, pc2_sim2, fel2, xedges2, yedges2, pc1_apo, pc2_apo, fel_apo, xedges_apo, yedges_apo
+    except Exception as e:
+        print(f"Error in PCA/FEL calculation: {e}")
+        return None
+
+def cluster_pca_results(pc1_sim1, pc2_sim1, pc1_sim2, pc2_sim2, pc1_apo, pc2_apo,
+                        output_prefix="pca_fel", n_components=None, max_components=10):
+    """
+    对PCA结果进行GMM聚类，生成聚类数据文件和散点图。如果n_components为None，则自动选择最佳簇数量。
+    在散点图上为每个簇的质心添加簇编号标签，标签颜色与簇颜色统一，且不显示颜色条。
+    各子图相同分型的散点配色一致。
+    """
+    try:
+        # 合并所有模拟的PCA数据
+        all_pca_data = np.vstack((np.column_stack((pc1_sim1, pc2_sim1)),
+                                  np.column_stack((pc1_sim2, pc2_sim2)),
+                                  np.column_stack((pc1_apo, pc2_apo))))
+
+        # 自动选择最佳簇数量（如果n_components为None）
+        if n_components is None:
+            bic_scores = []
+            n_range = range(1, max_components + 1)
+            for n in n_range:
+                gmm = GaussianMixture(n_components=n, covariance_type='full', random_state=42)
+                gmm.fit(all_pca_data)
+                bic_scores.append(gmm.bic(all_pca_data))
+            n_components = n_range[np.argmin(bic_scores)]
+            print(f"Automatically selected n_components={n_components} using BIC")
+
+            # 绘制BIC曲线
+            plt.figure(figsize=(8, 6))
+            plt.plot(n_range, bic_scores, marker='o')
+            plt.xlabel("Number of Components", fontsize=12)
+            plt.ylabel("BIC Score", fontsize=12)
+            plt.title("BIC Score vs Number of Components", fontsize=14)
+            plt.savefig(f"{output_prefix}_bic_plot.png", dpi=300)
+            plt.close()
+            print(f"BIC plot saved to {output_prefix}_bic_plot.png")
+
+        # 进行GMM聚类
+        gmm = GaussianMixture(n_components=n_components, covariance_type='full', random_state=42)
+        labels = gmm.fit_predict(all_pca_data)
+        means = gmm.means_  # 获取每个簇的质心
+
+        # 分割标签到各个模拟
+        n_frames = len(pc1_sim1)
+        labels_sim1 = labels[:n_frames]
+        labels_sim2 = labels[n_frames:2*n_frames]
+        labels_apo = labels[2*n_frames:]
+
+        # 保存聚类结果
+        np.savetxt(f"{output_prefix}_clusters_sim1.dat", np.column_stack((pc1_sim1, pc2_sim1, labels_sim1)),
+                   header="PC1 PC2 Cluster", fmt="%.3f %.3f %d")
+        np.savetxt(f"{output_prefix}_clusters_sim2.dat", np.column_stack((pc1_sim2, pc2_sim2, labels_sim2)),
+                   header="PC1 PC2 Cluster", fmt="%.3f %.3f %d")
+        np.savetxt(f"{output_prefix}_clusters_apo.dat", np.column_stack((pc1_apo, pc2_apo, labels_apo)),
+                   header="PC1 PC2 Cluster", fmt="%.3f %.3f %d")
+        print(f"Clustering data saved to {output_prefix}_clusters_sim1/2/apo.dat")
+
+        # 获取tab10颜色映射的颜色列表
+        tab10_colors = plt.cm.tab10(np.arange(n_components) % 10)
+
+        # 绘制聚类散点图（同一label配色一致）
+        plt.figure(figsize=(18, 5))
+
+        # H-1-V 散点图
+        plt.subplot(1, 3, 1)
+        for i in range(n_components):
+            mask = labels_sim1 == i
+            plt.scatter(pc1_sim1[mask], pc2_sim1[mask], color=tab10_colors[i], s=10, label=f'Cluster {i}')
+            if np.any(mask):
+                centroid = np.mean(np.column_stack((pc1_sim1[mask], pc2_sim1[mask])), axis=0)
+                plt.text(centroid[0], centroid[1], f'{i}', fontsize=12, weight='bold',
+                         color=tab10_colors[i], ha='center', va='center',
+                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='black'))
+        plt.xlabel("Principal Component 1", fontsize=12)
+        plt.ylabel("Principal Component 2", fontsize=12)
+        plt.title(f"Clusters: H-1-V (GMM, n={n_components})", fontsize=14)
+        # plt.legend(markerscale=2, fontsize=10, loc='best', frameon=True)
+
+        # H-3-V 散点图
+        plt.subplot(1, 3, 2)
+        for i in range(n_components):
+            mask = labels_sim2 == i
+            plt.scatter(pc1_sim2[mask], pc2_sim2[mask], color=tab10_colors[i], s=10, label=f'Cluster {i}')
+            if np.any(mask):
+                centroid = np.mean(np.column_stack((pc1_sim2[mask], pc2_sim2[mask])), axis=0)
+                plt.text(centroid[0], centroid[1], f'{i}', fontsize=12, weight='bold',
+                         color=tab10_colors[i], ha='center', va='center',
+                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='black'))
+        plt.xlabel("Principal Component 1", fontsize=12)
+        plt.ylabel("Principal Component 2", fontsize=12)
+        plt.title(f"Clusters: H-3-V (GMM, n={n_components})", fontsize=14)
+        # plt.legend(markerscale=2, fontsize=10, loc='best', frameon=True)
+
+        # apo 散点图
+        plt.subplot(1, 3, 3)
+        for i in range(n_components):
+            mask = labels_apo == i
+            plt.scatter(pc1_apo[mask], pc2_apo[mask], color=tab10_colors[i], s=10, label=f'Cluster {i}')
+            if np.any(mask):
+                centroid = np.mean(np.column_stack((pc1_apo[mask], pc2_apo[mask])), axis=0)
+                plt.text(centroid[0], centroid[1], f'{i}', fontsize=12, weight='bold',
+                         color=tab10_colors[i], ha='center', va='center',
+                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='black'))
+        plt.xlabel("Principal Component 1", fontsize=12)
+        plt.ylabel("Principal Component 2", fontsize=12)
+        plt.title(f"Clusters: apo (GMM, n={n_components})", fontsize=14)
+        plt.legend(markerscale=2, fontsize=10, loc='best', frameon=True)
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_clusters_plot.png", dpi=300)
+        plt.close()
+        print(f"Clustering plot saved to {output_prefix}_clusters_plot.png")
+
+        return labels_sim1, labels_sim2, labels_apo, n_components
+    except Exception as e:
+        print(f"Error in clustering: {e}")
+        return None
+    
+def extract_key_frames(topology, trajectory, fel, xedges, yedges, output_prefix, energy_threshold=1.5):
+    """
+    从FEL提取低能量帧，保存为PDB文件。
+    """
+    try:
+        u = mda.Universe(topology, trajectory)
+        pca_data = np.loadtxt(f"{output_prefix}.dat", skiprows=1)
+        pc1, pc2 = pca_data[:, 0], pca_data[:, 1]
+
+        low_energy_frames = []
+        for i in range(fel.shape[0]):
+            for j in range(fel.shape[1]):
+                if fel[i, j] < energy_threshold:
+                    x_min, x_max = xedges[i], xedges[i + 1]
+                    y_min, y_max = yedges[j], yedges[j + 1]
+                    frames = np.where((pc1 >= x_min) & (pc1 < x_max) & (pc2 >= y_min) & (pc2 < y_max))[0]
+                    # if 'h3v' in topology:
+                    #     frames = np.where((pc1 >= x_min) & (pc1 < x_max) & (pc2 >= y_min) & (pc2 < y_max) & (pc1 > 0) & (pc1 < 50) & (pc2 < 0))[0]
+                    # elif 'h1v' in topology:
+                    #     frames = np.where((pc1 >= x_min) & (pc1 < x_max) & (pc2 >= y_min) & (pc2 < y_max) & (pc1 > -55) & (pc1 < -30))[0]
+                    # elif 'apo' in topology:
+                    #     frames = np.where((pc1 >= x_min) & (pc1 < x_max) & (pc2 >= y_min) & (pc2 < y_max) & (pc1 > -140) & (pc1 < -120))[0]
+                    if len(frames) > 0:
+                        low_energy_frames.append(frames[0])
+        protein_selection = u.select_atoms("protein or resname MOL") if "resname MOL" in u.atoms.names else u.select_atoms("protein")
+        for i, frame_idx in enumerate(low_energy_frames):
+            pass
+        #     u.trajectory[frame_idx]
+        #     with mda.Writer(f"{output_prefix}_frame_{i}.pdb") as W:
+        #         W.write(protein_selection)
+        # print(f"Extracted {len(low_energy_frames)} key frames to {output_prefix}_frame_*.pdb")
+
+        return low_energy_frames
+    except Exception as e:
+        print(f"Error in key frame extraction: {e}")
+        return []
+
+def calculate_cluster_mmpbsa(labels_sim1, labels_sim2, labels_apo, n_components, mmpbsa_file1="h1v_mmpbsa_delta.csv",
+                            mmpbsa_file2="h3v_mmpbsa_delta.csv", mmpbsa_file3="apo_mmpbsa_delta.csv",
+                            output_prefix="pca_fel"):
+    """
+    计算每个轨迹中各个分群的平均MM/PBSA值及其标准差，保存结果并生成分组柱状图。
+    横坐标为H-1-V、H-3-V、apo，每组内展示各cluster能量，条上标注数值，带网格线。
+    仅显示有数据的cluster，不显示空白条。
+    """
+    try:
+        # 初始化结果存储
+        results = {
+            'H-1-V': [],
+            'H-3-V': [],
+            'apo': []
+        }
+        cluster_ids = np.arange(n_components)
+        # 读取MMPBSA结果并筛选Frame > 2000
+        df1 = pd.read_csv(mmpbsa_file1)
+        df2 = pd.read_csv(mmpbsa_file2)
+        df3 = pd.read_csv(mmpbsa_file3)
+        mmpbsa_sim1 = df1[df1["Frame"] > 2000]["TOTAL"].values
+        mmpbsa_sim2 = df2[df2["Frame"] > 2000]["TOTAL"].values
+        mmpbsa_apo = df3[df3["Frame"] > 2000]["TOTAL"].values
+        print("h1v_mmpbsa_delta (Frame>2000):", mmpbsa_sim1.mean())
+        print("h3v_mmpbsa_delta (Frame>2000):", mmpbsa_sim2.mean())
+        print("apo_mmpbsa_delta (Frame>2000):", mmpbsa_apo.mean())
+
+        # 计算每个轨迹的簇平均MM/PBSA值和标准差
+        for cluster_id in cluster_ids:
+            # H-1-V
+            mask_sim1 = labels_sim1 == cluster_id
+            if np.any(mask_sim1):
+                mean_sim1 = np.mean(mmpbsa_sim1[mask_sim1])
+                std_sim1 = np.std(mmpbsa_sim1[mask_sim1])
+                results['H-1-V'].append((cluster_id, mean_sim1, std_sim1))
+            else:
+                results['H-1-V'].append((cluster_id, np.nan, np.nan))
+
+            # H-3-V
+            mask_sim2 = labels_sim2 == cluster_id
+            if np.any(mask_sim2):
+                mean_sim2 = np.mean(mmpbsa_sim2[mask_sim2])
+                std_sim2 = np.std(mmpbsa_sim2[mask_sim2])
+                results['H-3-V'].append((cluster_id, mean_sim2, std_sim2))
+            else:
+                results['H-3-V'].append((cluster_id, np.nan, np.nan))
+
+            # apo
+            mask_apo = labels_apo == cluster_id
+            if np.any(mask_apo):
+                mean_apo = np.mean(mmpbsa_apo[mask_apo])
+                std_apo = np.std(mmpbsa_apo[mask_apo])
+                results['apo'].append((cluster_id, mean_apo, std_apo))
+            else:
+                results['apo'].append((cluster_id, np.nan, np.nan))
+
+        # 保存结果到文件
+        with open(f"{output_prefix}_mmpbsa_stats.dat", 'w') as f:
+            f.write("Cluster H-1-V_Mean H-1-V_Std H-3-V_Mean H-3-V_Std apo_Mean apo_Std\n")
+            for i in cluster_ids:
+                h1v = results['H-1-V'][i]
+                h3v = results['H-3-V'][i]
+                apo = results['apo'][i]
+                f.write(f"{i} {h1v[1]:.3f} {h1v[2]:.3f} {h3v[1]:.3f} {h3v[2]:.3f} {apo[1]:.3f} {apo[2]:.3f}\n")
+        print(f"MM/PBSA statistics saved to {output_prefix}_mmpbsa_stats.dat")
+
+        # 绘制分组柱状图（仅显示有数据的cluster）
+        plt.figure(figsize=(10, 6))
+        x_labels = ['H-1-V', 'H-3-V', 'apo']
+        x = np.arange(len(x_labels))
+        tab10_colors = plt.cm.tab10(np.arange(n_components) % 10)
+
+        # 每组分别画有数据的cluster
+        for idx, group in enumerate(x_labels):
+            group_data = results[group]
+            # 只保留有数据的cluster
+            valid = [(cid, mean, std) for cid, mean, std in group_data if not np.isnan(mean)]
+            if not valid:
+                continue
+            # 计算每个条的位置
+            n_valid = len(valid)
+            bar_width = 0.8 / max(n_valid, 1)
+            for i, (cid, mean, std) in enumerate(valid):
+                pos = x[idx] - 0.4 + bar_width/2 + i * bar_width
+                bar = plt.bar(pos, mean, bar_width, yerr=std, color=tab10_colors[cid], capsize=5, label=f'{group} Cluster {cid}')
+                plt.text(pos, mean, f'{mean:.1f}', ha='center', va='bottom', fontsize=7)
+
+        plt.xlabel("Group", fontsize=12)
+        plt.ylabel("Mean MM/PBSA (kJ/mol)", fontsize=12)
+        plt.title("Mean MM/PBSA by Cluster in Each Group", fontsize=14)
+        plt.xticks(x, x_labels)
+        plt.legend(title="Cluster", bbox_to_anchor=(1.02, 1), loc='upper left')
+        plt.grid(True, linestyle="--", alpha=0.7, axis='y')
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_mmpbsa_barplot.png", dpi=300)
+        plt.close()
+        print(f"MM/PBSA bar plot saved to {output_prefix}_mmpbsa_barplot.png")
+
+        return results
+    except Exception as e:
+        print(f"Error in MM/PBSA calculation: {e}")
+        return None
+
+def save_results(pc1_sim1, pc2_sim1, fel1, xedges1, yedges1,
+                pc1_sim2, pc2_sim2, fel2, xedges2, yedges2,
+                pc1_apo, pc2_apo, fel_apo, xedges_apo, yedges_apo,
+                output_prefix="pca_fel", binary=True):
+    """保存PCA和FEL计算结果"""
+    if binary:
+        with open(f"{output_prefix}_results.pkl", "wb") as f:
+            pickle.dump({
+                'pc1_sim1': pc1_sim1, 'pc2_sim1': pc2_sim1, 'fel1': fel1, 'xedges1': xedges1, 'yedges1': yedges1,
+                'pc1_sim2': pc1_sim2, 'pc2_sim2': pc2_sim2, 'fel2': fel2, 'xedges2': xedges2, 'yedges2': yedges2,
+                'pc1_apo': pc1_apo, 'pc2_apo': pc2_apo, 'fel_apo': fel_apo, 'xedges_apo': xedges_apo, 'yedges_apo': yedges_apo
+            }, f)
+    else:
+        np.savetxt(f"{output_prefix}_pc1_sim1.txt", pc1_sim1)
+        np.savetxt(f"{output_prefix}_pc2_sim1.txt", pc2_sim1)
+        np.savetxt(f"{output_prefix}_fel1.txt", fel1)
+        np.savetxt(f"{output_prefix}_xedges1.txt", xedges1)
+        np.savetxt(f"{output_prefix}_yedges1.txt", yedges1)
+        np.savetxt(f"{output_prefix}_pc1_sim2.txt", pc1_sim2)
+        np.savetxt(f"{output_prefix}_pc2_sim2.txt", pc2_sim2)
+        np.savetxt(f"{output_prefix}_fel2.txt", fel2)
+        np.savetxt(f"{output_prefix}_xedges2.txt", xedges2)
+        np.savetxt(f"{output_prefix}_yedges2.txt", yedges2)
+        np.savetxt(f"{output_prefix}_pc1_apo.txt", pc1_apo)
+        np.savetxt(f"{output_prefix}_pc2_apo.txt", pc2_apo)
+        np.savetxt(f"{output_prefix}_fel_apo.txt", fel_apo)
+        np.savetxt(f"{output_prefix}_xedges_apo.txt", xedges_apo)
+        np.savetxt(f"{output_prefix}_yedges_apo.txt", yedges_apo)
+
+def load_results(output_prefix="pca_fel", binary=True):
+    """从磁盘加载PCA和FEL计算结果"""
+    if binary:
+        with open(f"{output_prefix}_results.pkl", "rb") as f:
+            data = pickle.load(f)
+            return (
+                data['pc1_sim1'], data['pc2_sim1'], data['fel1'], data['xedges1'], data['yedges1'],
+                data['pc1_sim2'], data['pc2_sim2'], data['fel2'], data['xedges2'], data['yedges2'],
+                data['pc1_apo'], data['pc2_apo'], data['fel_apo'], data['xedges_apo'], data['yedges_apo']
+            )
+    else:
+        pc1_sim1 = np.loadtxt(f"{output_prefix}_pc1_sim1.txt")
+        pc2_sim1 = np.loadtxt(f"{output_prefix}_pc2_sim1.txt")
+        fel1 = np.loadtxt(f"{output_prefix}_fel1.txt")
+        xedges1 = np.loadtxt(f"{output_prefix}_xedges1.txt")
+        yedges1 = np.loadtxt(f"{output_prefix}_yedges1.txt")
+        pc1_sim2 = np.loadtxt(f"{output_prefix}_pc1_sim2.txt")
+        pc2_sim2 = np.loadtxt(f"{output_prefix}_pc2_sim2.txt")
+        fel2 = np.loadtxt(f"{output_prefix}_fel2.txt")
+        xedges2 = np.loadtxt(f"{output_prefix}_xedges2.txt")
+        yedges2 = np.loadtxt(f"{output_prefix}_yedges2.txt")
+        pc1_apo = np.loadtxt(f"{output_prefix}_pc1_apo.txt")
+        pc2_apo = np.loadtxt(f"{output_prefix}_pc2_apo.txt")
+        fel_apo = np.loadtxt(f"{output_prefix}_fel_apo.txt")
+        xedges_apo = np.loadtxt(f"{output_prefix}_xedges_apo.txt")
+        yedges_apo = np.loadtxt(f"{output_prefix}_yedges_apo.txt")
+        return (
+            pc1_sim1, pc2_sim1, fel1, xedges1, yedges1,
+            pc1_sim2, pc2_sim2, fel2, xedges2, yedges2,
+            pc1_apo, pc2_apo, fel_apo, xedges_apo, yedges_apo
+        )
+
+def analyze_mmpbsa_with_fel(key_frames_sim1, key_frames_sim2, key_frames_apo, mmpbsa_file1="h1v_mmpbsa_delta.csv",
+                            mmpbsa_file2="h3v_mmpbsa_delta.csv", mmpbsa_file3="apo_mmpbsa_delta.csv",
+                            output_file="mmpbsa_fel_delta.dat", plot_file="mmpbsa_fel_plot_delta.png"):
+    """
+    关联FEL低能量帧与gmx_MMPBSA结合能（仅sim1和sim2），生成分布图。
+    """
+    try:
+        df1 = pd.read_csv(mmpbsa_file1)
+        df2 = pd.read_csv(mmpbsa_file2)
+        df3 = pd.read_csv(mmpbsa_file3)
+        print("h1v_mmpbsa_delta:", df1["TOTAL"].mean())
+        print("h3v_mmpbsa_delta:", df2["TOTAL"].mean())
+        print("apo_mmpbsa_delta:", df3["TOTAL"].mean())
+        delta_g_sim1 = df1[df1["Frame"].isin(key_frames_sim1)]["TOTAL"].values
+        delta_g_sim2 = df2[df2["Frame"].isin(key_frames_sim2)]["TOTAL"].values
+        delta_g_apo = df3[df3["Frame"].isin(key_frames_apo)]["TOTAL"].values
+        print("h1v_mmpbsa_delta_extract:", np.mean(delta_g_sim1))
+        print("h3v_mmpbsa_delta_extract:", np.mean(delta_g_sim2))
+        print("apo_mmpbsa_delta_extract:", np.mean(delta_g_apo))
+
+        np.savetxt(output_file.replace('.dat', '_sim1.dat'),
+                   np.column_stack((np.arange(len(delta_g_sim1)), delta_g_sim1)),
+                   header="Frame_Sim1 Delta_G_Sim1", fmt="%.3f")
+        np.savetxt(output_file.replace('.dat', '_sim2.dat'),
+                   np.column_stack((np.arange(len(delta_g_sim2)), delta_g_sim2)),
+                   header="Frame_Sim2 Delta_G_Sim2", fmt="%.3f")
+        np.savetxt(output_file.replace('.dat', '_apo.dat'),
+                   np.column_stack((np.arange(len(delta_g_apo)), delta_g_apo)),
+                   header="Frame_Apo Delta_G_Apo", fmt="%.3f")
+        print(f"MMPBSA data saved to separate files")
+        plt.figure(figsize=(8, 6))
+        plt.hist(delta_g_sim1, bins=35, alpha=0.5, label="H-1-V", color=colors['H-1-V'])
+        plt.hist(delta_g_sim2, bins=35, alpha=0.5, label="H-3-V", color=colors['H-3-V'])
+        plt.hist(delta_g_apo, bins=35, alpha=0.5, label="Apo", color=colors['apo'])
+        plt.xlabel("Binding Free Energy (kJ/mol)", fontsize=12)
+        plt.ylabel("Frequency", fontsize=12)
+        plt.title("Binding Energy Distribution of Key Frames", fontsize=14)
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(plot_file, dpi=300)
+        plt.close()
+        print(f"MMPBSA plot saved to {plot_file}")
+        return np.mean(delta_g_sim2) - np.mean(delta_g_sim1)
+    except Exception as e:
+        print(f"Error in MMPBSA analysis: {e}")
+        return -1
+
+def plot_mmpbsa(mmpbsa_file1="h1v_mmpbsa_delta.csv",
+                 mmpbsa_file2="h3v_mmpbsa_delta.csv",
+                 mmpbsa_file_apo="apo_mmpbsa_delta.csv",
+                 output_prefix="mmpbsa_total"):
+    """
+    读取 MMPBSA 文件，绘制 H-1-V、H-3-V 和 apo 的结合自由能变化曲线。
+    输入：MMPBSA 文件路径，输出文件名前缀
+    输出：mmpbsa_total.dat, mmpbsa_total_plot.png
+    """
+    try:
+        # 检查文件存在性
+        required_files = [mmpbsa_file1, mmpbsa_file2, mmpbsa_file_apo]
+        for f in required_files:
+            if not os.path.exists(f):
+                print(f"Error: MMPBSA file {f} not found.")
+                return
+
+        # 读取 MMPBSA 数据
+        df1 = pd.read_csv(mmpbsa_file1)
+        df2 = pd.read_csv(mmpbsa_file2)
+        df_apo = pd.read_csv(mmpbsa_file_apo)
+
+        # 验证数据完整性
+        for df, name in [(df1, "H-1-V"), (df2, "H-3-V"), (df_apo, "apo")]:
+            if 'Frame' not in df.columns or 'TOTAL' not in df.columns:
+                print(f"Error: {name} MMPBSA file must contain 'Frame' and 'TOTAL' columns.")
+                return
+
+        # 提取帧数和 TOTAL 数据
+        frames1 = df1['Frame'].values
+        total1 = df1['TOTAL'].values
+        frames2 = df2['Frame'].values
+        total2 = df2['TOTAL'].values
+        frames_apo = df_apo['Frame'].values
+        total_apo = df_apo['TOTAL'].values
+
+        # 保存数据到文件
+        max_frames = max(len(frames1), len(frames2), len(frames_apo))
+        data = np.full((max_frames, 7), np.nan)  # 7 列：帧数 + 3组 (Frame, TOTAL)
+        data[:len(frames1), 0] = frames1
+        data[:len(frames1), 1] = total1
+        data[:len(frames2), 2] = frames2
+        data[:len(frames2), 3] = total2
+        data[:len(frames_apo), 4] = frames_apo
+        data[:len(frames_apo), 5] = total_apo
+        # 统一帧数列
+        unified_frames = np.arange(max_frames)
+        data[:, 6] = unified_frames
+        np.savetxt(f"{output_prefix}.dat",
+                   data,
+                   header="Unified_Frame H1V_Frame H1V_TOTAL H3V_Frame H3V_TOTAL apo_Frame apo_TOTAL",
+                   fmt="%.0f %.0f %.3f %.0f %.3f %.0f %.3f")
+        print(f"MMPBSA data saved to {output_prefix}.dat")
+
+        # 打印平均结合自由能
+        print(f"H-1-V MMPBSA TOTAL mean: {np.mean(total1):.3f} kJ/mol")
+        print(f"H-3-V MMPBSA TOTAL mean: {np.mean(total2):.3f} kJ/mol")
+        print(f"apo MMPBSA TOTAL mean: {np.mean(total_apo):.3f} kJ/mol")
+
+        # 绘制结合自由能曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(frames1, total1, label="H-1-V", color=colors['H-1-V'])
+        plt.plot(frames2, total2, label="H-3-V", color=colors['H-3-V'])
+        plt.plot(frames_apo, total_apo, label="apo", color=colors['apo'])
+        plt.xlabel("Frame", fontsize=12)
+        plt.ylabel("Binding Free Energy (kJ/mol)", fontsize=12)
+        plt.title("MMPBSA Binding Free Energy over Frames", fontsize=14)
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_plot.png", dpi=300)
+        plt.close()
+        print(f"MMPBSA plot saved to {output_prefix}_plot.png")
+
+    except Exception as e:
+        print(f"Error in MMPBSA plotting: {e}")
+
+def run_all_analyses():
+    """
+    运行所有分析：RMSD、RMSF、氢键、接触、PCA、FEL、关键帧提取、MMPBSA关联。
+    """
+    print("Starting molecular dynamics analysis...")
+
+    # 检查文件
+    required_files = ["./h1v/md.tpr", "./h1v/md_pbc.xtc", "./h3v/md.tpr", "./h3v/md_pbc.xtc", "./apo/md.tpr", "./apo/md_pbc.xtc"]
+    for f in required_files:
+        if not os.path.exists(f):
+            print(f"Error: File {f} not found.")
+            return
+
+    # 运行分析
+    # calculate_rmsd()
+    # calculate_rmsf()
+    # calculate_hbonds()
+    calculate_contacts()
+    plot_mmpbsa()
+    pca_fel_results = calculate_pca_fel()
+    # pca_fel_results = load_results()
+    if pca_fel_results:
+        pc1_sim1, pc2_sim1, fel1, xedges1, yedges1, pc1_sim2, pc2_sim2, fel2, xedges2, yedges2, pc1_apo, pc2_apo, fel_apo, xedges_apo, yedges_apo = pca_fel_results
+        cluster_pca_return_results = cluster_pca_results(pc1_sim1, pc2_sim1, pc1_sim2, pc2_sim2, pc1_apo, pc2_apo, n_components=None)
+        labels_sim1, labels_sim2, labels_apo, n_components =cluster_pca_return_results
+        calculate_cluster_mmpbsa(labels_sim1, labels_sim2, labels_apo,n_components=n_components)
+        save_results(pc1_sim1, pc2_sim1, fel1, xedges1, yedges1, pc1_sim2, pc2_sim2, fel2, xedges2, yedges2, pc1_apo, pc2_apo, fel_apo, xedges_apo, yedges_apo)
+        key_frames_sim1 = extract_key_frames("./h1v/md.tpr", "./h1v/md_pbc.xtc", fel1, xedges1, yedges1, "pca_fel_sim1")
+        key_frames_sim2 = extract_key_frames("./h3v/md.tpr", "./h3v/md_pbc.xtc", fel2, xedges2, yedges2, "pca_fel_sim2")
+        key_frames_apo = extract_key_frames("./apo/md.tpr", "./apo/md_pbc.xtc", fel_apo, xedges_apo, yedges_apo, "pca_fel_apo")
+        if os.path.exists("h1v_mmpbsa_delta.csv") and os.path.exists("h3v_mmpbsa_delta.csv") and os.path.exists("apo_mmpbsa_delta.csv"):
+            analyze_mmpbsa_with_fel(key_frames_sim1, key_frames_sim2, key_frames_apo)
+        else:
+            print("Error: MMPBSA files not found.")
+    print("All analyses completed.")
+
+if __name__ == "__main__":
+    os.chdir('/home/liguowang/HD1/HSD11b1/HSD_20250519')
+    run_all_analyses()
